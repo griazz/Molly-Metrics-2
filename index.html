@@ -137,6 +137,19 @@ box-shadow: inset 0 -10px 20px -10px rgba(212, 175, 55, 0.1); }
 .cwl-round-status { font-size: 9px; color: var(--accent-main); text-transform: uppercase; letter-spacing: 2px; }
 .cwl-round-body { max-height: 0; opacity: 0; padding: 0 20px; transition: all 0.4s ease; overflow: hidden; }
 .cwl-round-body.open { max-height: 2000px; padding: 0 20px 20px 20px; opacity: 1; }
+.status-badge { display: inline-flex; align-items: center; gap: 3px; padding: 3px 8px; border-radius: 100px; font-size: 9px; font-weight: 400; letter-spacing: 1.5px; text-transform: uppercase; }
+.badge-rushed { background: rgba(229,57,53,0.15); border: 1px solid rgba(229,57,53,0.35); color: #e57373; }
+.badge-inactive { background: rgba(255,152,0,0.15); border: 1px solid rgba(255,152,0,0.35); color: #ffb74d; }
+.badge-low-donor { background: rgba(140,126,126,0.15); border: 1px solid rgba(140,126,126,0.35); color: #a09090; }
+.badge-liability { background: rgba(179,114,196,0.15); border: 1px solid rgba(179,114,196,0.35); color: #ce93d8; }
+.badge-hit-rate { background: rgba(76,175,80,0.15); border: 1px solid rgba(76,175,80,0.35); color: #81c784; }
+.filter-chips { display: flex; gap: 8px; overflow-x: auto; padding: 4px 0 12px; scrollbar-width: none; -ms-overflow-style: none; }
+.filter-chips::-webkit-scrollbar { display: none; }
+.chip { flex-shrink: 0; padding: 6px 14px; border-radius: 100px; font-size: 10px; letter-spacing: 1px; text-transform: uppercase; cursor: pointer; border: 1px solid var(--border-color); color: var(--text-muted); background: transparent; transition: all 0.3s ease; }
+.chip.active { background: var(--accent-main); color: var(--bg-dark); border-color: var(--accent-main); }
+.chip:active { transform: scale(0.93); }
+.th-alert { display: flex; align-items: flex-start; gap: 8px; padding: 10px 12px; background: rgba(229,57,53,0.08); border: 1px solid rgba(229,57,53,0.3); border-radius: 8px; margin: 6px 0; font-size: 11px; color: #e57373; letter-spacing: 0.3px; }
+.liability-row { border-left: 2px solid rgba(179,114,196,0.5); padding-left: 8px; }
 </style>
 </head>
 <body>
@@ -197,6 +210,13 @@ box-shadow: inset 0 -10px 20px -10px rgba(212, 175, 55, 0.1); }
 </div>
 
 <div id="roster-tab" class="tab-content">
+<div class="filter-chips" id="roster-filter-chips" style="display:none;">
+  <div class="chip active" data-filter="all" onclick="setRosterFilter('all')">All</div>
+  <div class="chip" data-filter="cwl" onclick="setRosterFilter('cwl')">CWL</div>
+  <div class="chip" data-filter="rushed" onclick="setRosterFilter('rushed')">⚠ Rushed</div>
+  <div class="chip" data-filter="inactive" onclick="setRosterFilter('inactive')">Inactive</div>
+  <div class="chip" data-filter="lowdonor" onclick="setRosterFilter('lowdonor')">Low Donor</div>
+</div>
 <div class="control-row" id="roster-controls" style="display:none;">
 <input type="text" id="searchInput" placeholder="Search CWL Roster..." oninput="debouncedFilterRoster()">
 <select id="sortSelect" onchange="filterRoster()">
@@ -270,6 +290,7 @@ let clanData = {};
 let capitalLoot = 0;
 let warInfo = null;
 let chartsRegistry = { history: {}, hero: {}, pet: {}, radarHero: null, radarPet: null, capitalLine: null, activityHourly: null, activityDaily: null };
+let currentRosterFilter = 'all';
 
 const CWL_TAGS = ["#PG0R8GQPQ", "#YCRV8GP0U", "#RYPU89Y8", "#99JQPVU9Q", "#GRJRUYP0", "#8QGVV099U", "#2RL2JGJPJ", "#Y8LY2VUJ9", "#GYJ00RJ2Q", "#G9YR000R8", "#20YLLYC9P", "#QVCLVUQVY", "#9LGG22Q28", "#GGULC2CR", "#9R0C82GU"];
 
@@ -431,6 +452,7 @@ try {
     }
 
     document.getElementById('roster-controls').style.display = globalPlayerData.length > 0 ? "flex" : "none";
+    document.getElementById('roster-filter-chips').style.display = globalPlayerData.length > 0 ? "flex" : "none";
 
     renderActivityHub(data.activityGraphs);
     filterRoster(); renderCapitalBoard(); renderWar();
@@ -492,11 +514,26 @@ function renderActivityHub(graphs) {
   chartsRegistry.activityDaily = new Chart(document.getElementById('dailyActivityChart').getContext('2d'), { type: 'bar', data: { labels: dailyLabels, datasets: [{ data: graphs.daily, backgroundColor: accent, borderRadius: 3 }] }, options: barOpts });
 }
 
+function setRosterFilter(filter) {
+  currentRosterFilter = filter;
+  document.querySelectorAll('#roster-filter-chips .chip').forEach(c => {
+    c.classList.toggle('active', c.getAttribute('data-filter') === filter);
+  });
+  filterRoster();
+}
+
 function filterRoster() {
 const searchTerm = document.getElementById('searchInput').value.toLowerCase();
 const sortBy = document.getElementById('sortSelect').value;
 
-displayedPlayerData = globalPlayerData.filter(p => CWL_TAGS.includes(p.tag) && p.name.toLowerCase().includes(searchTerm));
+let pool;
+if (currentRosterFilter === 'rushed') pool = globalPlayerData.filter(p => p.isRushed);
+else if (currentRosterFilter === 'inactive') pool = globalPlayerData.filter(p => p.isInactive);
+else if (currentRosterFilter === 'lowdonor') pool = globalPlayerData.filter(p => p.isLowDonor);
+else if (currentRosterFilter === 'cwl') pool = globalPlayerData.filter(p => CWL_TAGS.includes(p.tag));
+else pool = globalPlayerData;
+
+displayedPlayerData = pool.filter(p => p.name.toLowerCase().includes(searchTerm));
 
 displayedPlayerData.sort((a, b) => {
 if (sortBy === 'comp') return b.percentage - a.percentage;
@@ -520,6 +557,13 @@ let activity = getActivityStatus(player.lastSeenTs);
 let safeId = player.name.replace(/[^a-zA-Z0-9]/g, '_') + '_' + index;
 let historyLogs = (player.recentlyCompleted && player.recentlyCompleted.length > 0) ?  `<div style="font-size:12px; margin-bottom: 24px;">✔  ${player.recentlyCompleted.slice(-3).join( '<br>✔ ' )}</div>` : '';
 
+let badgesHtml = '';
+if (player.isRushed) badgesHtml += `<span class="status-badge badge-rushed">⚠ Rushed</span>`;
+if (player.isInactive) badgesHtml += `<span class="status-badge badge-inactive">Inactive</span>`;
+if (player.isLowDonor) badgesHtml += `<span class="status-badge badge-low-donor">Low Donor</span>`;
+if (player.isHighLiability) badgesHtml += `<span class="status-badge badge-liability">Liability</span>`;
+if (player.hitRate !== null && player.hitRate !== undefined) badgesHtml += `<span class="status-badge badge-hit-rate">${player.hitRate}% 3★</span>`;
+
 htmlString += `
 <div class="player-card">
 <div class="card-header" onclick="toggleDetails(this, '${safeId}', ${globalPlayerData.indexOf(player)})">
@@ -527,6 +571,7 @@ htmlString += `
 <div style="display:flex; align-items:center;"><span class="activity-dot" style="color: ${activity.color}; background: ${activity.color};"></span>${player.name}</div>
 <div><span>${parseFloat(player.percentage)}%</span></div>
 </div>
+${badgesHtml ? `<div style="margin-bottom: 6px; display:flex; flex-wrap: wrap; gap: 4px;">${badgesHtml}</div>` : ''}
 <div class="timestamp-sub">${activity.text}</div>
 <div class="progress-bg"><div class="progress-fill" style="width: ${player.percentage}%;"></div></div>
 </div>
@@ -534,7 +579,7 @@ htmlString += `
 ${historyLogs}
 <div class="stat-grid">
 <div class="stat-box"><div class="stat-label">Activity</div><div class="stat-val">${player.activityScore || 0}</div></div>
-<div class="stat-box"><div class="stat-label">Lab</div><div class="stat-val">${player.labStats || 0}</div></div>
+<div class="stat-box"><div class="stat-label">Rush Score</div><div class="stat-val" style="color:${(player.rushScore||0) > 30 ? 'var(--dot-red)' : 'var(--accent-main)'}">${player.rushScore || 0}%</div></div>
 <div class="stat-box"><div class="stat-label">Heroes</div><div class="stat-val">${player.heroStats}</div></div>
 <div class="stat-box"><div class="stat-label">Pets</div><div class="stat-val">${player.petStats}</div></div>
 <div class="stat-box"><div class="stat-label">Donations</div><div class="stat-val">${(player.donations||0).toLocaleString()}</div></div>
@@ -637,18 +682,20 @@ html += `<p style="text-align:center; color:var(--text-muted); font-size:12px; p
 } else {
 html += `<div class="board-row" style="color:var(--text-muted); font-size:10px; text-transform:uppercase; border-bottom: 1px solid var(--border-color); padding-top:16px;">
 <div style="flex:1;">Operator</div>
-<div style="width:65px; text-align:center;">Offense<br>(3★ Hit)</div>
+<div style="width:65px; text-align:center;">Atk<br>(3★/HR)</div>
 <div style="width:65px; text-align:center;">Defense<br>(★ Given)</div>
 </div>`;
 cwlPlayers.forEach((p) => {
-let offColor = (p.cwlStats.attacks > 0 && p.cwlStats.threeStars === p.cwlStats.attacks) ? "var(--dot-green)" : "var(--text-muted)";
+let hr = p.hitRate !== null && p.hitRate !== undefined ? p.hitRate : 0;
+let offColor = hr >= 66 ? "var(--dot-green)" : (hr >= 33 ? "var(--dot-yellow)" : (p.cwlStats.attacks > 0 ? "var(--dot-red)" : "var(--text-muted)"));
 let defRatio = p.cwlStats.defenses > 0 ? (p.cwlStats.defStars / p.cwlStats.defenses).toFixed(1) : 0;
 let defColor = defRatio >= 3.0 ? "var(--dot-red)" : "var(--text-muted)";
+let liabilityBadgeHtml = p.isHighLiability ? ` <span class="status-badge badge-liability" style="font-size:8px; padding:2px 5px;">⚠</span>` : '';
 
 html += `<div class="board-row">
-<div style="flex:1;">${p.name}</div>
-<div style="width:65px; text-align:center; color:${offColor}">${p.cwlStats.attacks} atk (${p.cwlStats.threeStars})</div>
-<div style="width:65px; text-align:center; color:${defColor}">${p.cwlStats.defenses} def (${p.cwlStats.defStars})</div>
+<div style="flex:1;">${p.name}${liabilityBadgeHtml}</div>
+<div style="width:65px; text-align:center; color:${offColor}">${p.cwlStats.attacks}atk<br><span style="font-size:10px;">${p.cwlStats.threeStars}★ ${hr}%</span></div>
+<div style="width:65px; text-align:center; color:${defColor}">${p.cwlStats.defenses}def<br><span style="font-size:10px;">${p.cwlStats.defStars}★</span></div>
 </div>`;
 });
 }
@@ -693,15 +740,19 @@ thHtml += `<div style="display:flex; align-items:center; font-size:11px;">
 });
 thHtml += `</div></div>`;
 
-let pat = round.attackPattern || { mirrors: 0, dips: 0, reaches: 0, total: 0, threeStars: 0 };
-let hitRate = pat.total > 0 ? Math.round((pat.threeStars/pat.total)*100) : 0;
+let pat = round.attackPattern || { mirrors: 0, dips: 0, reaches: 0, total: 0, threeStars: 0, hitRate: 0, extremeDips: 0, extremeReaches: 0 };
+let atkHitRate = pat.hitRate !== undefined ? pat.hitRate : (pat.total > 0 ? Math.round((pat.threeStars/pat.total)*100) : 0);
+let thAlerts = '';
+if ((pat.extremeDips || 0) > 0) thAlerts += `<div class="th-alert">⚠ Sandbagging: ${pat.extremeDips} attack(s) 2+ TH levels DOWN — easy stars for them.</div>`;
+if ((pat.extremeReaches || 0) > 0) thAlerts += `<div class="th-alert">⚔ Brave Reach: ${pat.extremeReaches} attack(s) 2+ TH levels UP — high risk signal.</div>`;
 let patHtml = `<div style="margin-top:16px; padding:12px; background:rgba(0,0,0,0.2); border:1px solid var(--border-color); border-radius:8px; text-align:center;">
 <p style="font-size: 10px; color: var(--text-muted); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px;">Enemy Attack Behavior Profile</p>
-<div style="display:flex; justify-content:space-around; font-size:11px;">
+${thAlerts}
+<div style="display:flex; justify-content:space-around; font-size:11px; margin-top: ${thAlerts ? '8px' : '0'};">
 <div><span style="color:var(--text-muted); display:block; font-size:9px;">Mirrors</span><span style="color:var(--accent-main); font-size:14px;">${pat.mirrors}</span></div>
 <div><span style="color:var(--text-muted); display:block; font-size:9px;">Dips</span><span style="color:var(--dot-red); font-size:14px;">${pat.dips}</span></div>
 <div><span style="color:var(--text-muted); display:block; font-size:9px;">Reaches</span><span style="color:var(--dot-green); font-size:14px;">${pat.reaches}</span></div>
-<div><span style="color:var(--text-muted); display:block; font-size:9px;">Hit Rate</span><span style="color:var(--text-main); font-size:14px;">${hitRate}%</span></div>
+<div><span style="color:var(--text-muted); display:block; font-size:9px;">True Hit Rate</span><span style="color:var(--text-main); font-size:14px;">${atkHitRate}%</span></div>
 </div>
 </div>`;
 
@@ -712,11 +763,11 @@ let atkStatus = e.attacks > 0 ? `<span style="color:var(--dot-red);">⚔️</spa
 let stHtml = (e.superTroops && e.superTroops.length > 0) ? `<br><span style="color:var(--accent-secondary); font-size:9px;">Boosts: ${e.superTroops.join(', ')}</span>` : '';
 let eqHtml = (e.epicEquip && e.epicEquip.length > 0) ? `<br><span style="color:#b372c4; font-size:9px;">Max Epics: ${e.epicEquip.join(', ')}</span>` : '';
 
-rosterHtml += `<div style="display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid rgba(212,175,55,0.1); font-size:11px;">
+rosterHtml += `<div class="${e.isHighLiability ? 'liability-row' : ''}" style="display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid rgba(212,175,55,0.1); font-size:11px;">
 <div>
 <span style="color:var(--text-muted); width:24px; display:inline-block;">#${e.mapPosition}</span>
 ${e.name} <span style="color:var(--accent-main); font-size:9px; margin-left:4px;">TH${e.th}</span>
-${stHtml}
+${e.isHighLiability ? `<span class="status-badge badge-liability" style="font-size:8px; padding:2px 5px; margin-left:4px;">Liability</span>` : ''}${stHtml}
 ${eqHtml}
 </div>
 <div>${atkStatus}</div>
