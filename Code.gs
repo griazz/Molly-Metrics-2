@@ -2,23 +2,65 @@ const API_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiIsImtpZCI6IjI4YTMxOGY3LTAwM
 const CLAN_TAG = "%23YQP0GJ9";
 const BASE_URL = "https://cocproxy.royaleapi.dev/v1";
 
-// NEW: Function to programmatically create the 30-minute auto-update trigger
-function createAutoSyncTrigger() {
-  // Clear any existing triggers to prevent duplicates
-  const triggers = ScriptApp.getProjectTriggers();
-  for (let i = 0; i < triggers.length; i++) {
-    if (triggers[i].getHandlerFunction() === 'syncClanData') {
-      ScriptApp.deleteTrigger(triggers[i]);
-    }
+// Minimum expected hero totals by TH level (for rush detection)
+const MIN_HERO_TOTALS = { 9: 20, 10: 50, 11: 100, 12: 150, 13: 200, 14: 260, 15: 330, 16: 400, 17: 465 };
+
+// Thresholds for advanced analytics flags
+const LIABILITY_STARS_MULTIPLIER = 2.5;   // avg stars/defense above this = high liability
+const MIN_TH_FOR_DONATION_CHECK = 10;     // TH level below which donations aren't flagged
+const MIN_EXPECTED_DONATIONS = 100;       // donations below this at eligible TH = low donor
+const MAX_INACTIVITY_DAYS = 999;          // sentinel value when last-seen timestamp is unavailable
+const INACTIVITY_THRESHOLD_DAYS = 14;    // days without activity before player is flagged
+const TH_MISMATCH_THRESHOLD = 2;         // TH level difference that triggers mismatch alert
+
+// --- Helper: DRY content-service builder ---
+function buildJsonResponse(data) {
+  return ContentService.createTextOutput(JSON.stringify(data))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// --- Helper: centralized API fetch with error handling ---
+function fetchApi(url, options) {
+  try {
+    const res = UrlFetchApp.fetch(url, options);
+    if (res.getResponseCode() !== 200) return null;
+    return JSON.parse(res.getContentText());
+  } catch(e) {
+    console.warn("fetchApi error for " + url + ": " + e);
+    return null;
   }
-  
-  // Create a new trigger to run 'syncClanData' every 30 minutes
-  ScriptApp.newTrigger('syncClanData')
-    .timeBased()
-    .everyMinutes(30)
-    .create();
-    
-  console.log("Auto-sync trigger successfully created for every 30 minutes.");
+}
+
+// --- Helper: compute rush score (% of expected hero levels missing for this TH) ---
+function calcRushScore(heroLevels, thLevel) {
+  const heroTotal = Object.values(heroLevels).reduce((s, v) => s + (parseInt(v) || 0), 0);
+  const expected = MIN_HERO_TOTALS[thLevel] || 0;
+  if (expected === 0) return 0;
+  return Math.max(0, Math.round(((expected - heroTotal) / expected) * 100));
+}
+
+// Shared helper: returns true when a defender absorbs too many stars relative to attacks received
+function isHighLiabilityDef(defenses, defStars) {
+  return defenses >= 2 && defStars >= Math.floor(defenses * LIABILITY_STARS_MULTIPLIER);
+}
+
+// Function to programmatically create the 30-minute auto-update trigger
+function createAutoSyncTrigger() {
+  try {
+    const triggers = ScriptApp.getProjectTriggers();
+    for (let i = 0; i < triggers.length; i++) {
+      if (triggers[i].getHandlerFunction() === 'syncClanData') {
+        ScriptApp.deleteTrigger(triggers[i]);
+      }
+    }
+    ScriptApp.newTrigger('syncClanData')
+      .timeBased()
+      .everyMinutes(30)
+      .create();
+    console.log("Auto-sync trigger successfully created for every 30 minutes.");
+  } catch(e) {
+    console.error("createAutoSyncTrigger failed: " + e);
+  }
 }
 
 // The API Router
@@ -44,8 +86,7 @@ function doGet(e) {
     responseData = { error: error.message };
   }
 
-  return ContentService.createTextOutput(JSON.stringify(responseData))
-    .setMimeType(ContentService.MimeType.JSON);
+  return buildJsonResponse(responseData);
 }
 
 function cleanBuggedData() {
@@ -89,13 +130,13 @@ function syncClanData() {
 
   const options = { "method": "GET", "headers": { "Authorization": "Bearer " + API_TOKEN }, "muteHttpExceptions": true };
 
-  const membersRes = UrlFetchApp.fetch(`${BASE_URL}/clans/${CLAN_TAG}`, options);
-  if (membersRes.getResponseCode() !== 200) return;
-  const membersData = JSON.parse(membersRes.getContentText()).memberList;
+  const clanInfo = fetchApi(`${BASE_URL}/clans/${CLAN_TAG}`, options);
+  if (!clanInfo || !clanInfo.memberList) return;
+  const membersData = clanInfo.memberList;
 
-  fetchCapitalRaids(options);
-  fetchWarData(options);
-  updateCwlDatabase(options);
+  try { fetchCapitalRaids(options); } catch(e) { console.error("Capital raids sync failed: " + e); }
+  try { fetchWarData(options); } catch(e) { console.error("War data sync failed: " + e); }
+  try { updateCwlDatabase(options); } catch(e) { console.error("CWL database sync failed: " + e); }
 
   const requests = membersData.map(m => ({
     url: `${BASE_URL}/players/${m.tag.replace("#", "%23")}`,
@@ -118,19 +159,25 @@ function syncClanData() {
     });
   }
 
+  const allPlayerData = [];
   responses.forEach(res => {
-    if (res.getResponseCode() === 200) {
-      const playerData = JSON.parse(res.getContentText());
-      processOfficialApiData(playerData, now);
-      updateActivityLog(playerData, now, activitySheet, activityTagIndex);
+    try {
+      if (res.getResponseCode() === 200) {
+        const playerData = JSON.parse(res.getContentText());
+        const extracted = extractPlayerData(playerData, now);
+        allPlayerData.push({ tag: playerData.tag, extracted });
+        updateActivityLog(playerData, now, activitySheet, activityTagIndex);
+      }
+    } catch(e) {
+      console.error("Player processing error: " + e);
     }
   });
 
+  if (allPlayerData.length > 0) batchWriteToDataSheet(allPlayerData);
   CacheService.getScriptCache().remove("mollyDashboardData");
 }
 
-function processOfficialApiData(data, now) {
-  const tag = data.tag;
+function extractPlayerData(data, now) {
   let extractedLevels = {};
   let currentTotal = 0, heroTotal = 0, petTotal = 0, labTotal = 0;
 
@@ -167,19 +214,26 @@ function processOfficialApiData(data, now) {
   extractedLevels["Donations Received"] = data.donationsReceived || 0;
   extractedLevels["War Stars"] = data.warStars || 0;
   extractedLevels["Equipment"] = JSON.stringify(equipmentList);
-
-  updateDataSheet(tag, extractedLevels);
+  return extractedLevels;
 }
 
-function updateDataSheet(tag, extractedLevels) {
+function batchWriteToDataSheet(allPlayerData) {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Data");
   let headers = sheet.getRange(1, 1, 1, sheet.getLastColumn() || 1).getValues()[0];
   const requiredHeaders = ["Tag", "Username", "Timestamp", "TH", "Completion %", "Hero Total", "Pet Total", "Lab Total", "Barbarian King", "Archer Queen", "Grand Warden", "Royal Champion", "Minion Prince", "Dragon Duke", "Electro Owl", "Unicorn", "Frosty", "Diggy", "Phoenix", "Spirit Fox", "Angry Jelly", "Sneezy", "Greedy Raven", "Donations", "Donations Received", "War Stars", "Equipment"];
   if (!headers[0]) headers = [];
   requiredHeaders.forEach(req => { if (headers.indexOf(req) === -1) { headers.push(req); sheet.getRange(1, headers.length).setValue(req); } });
 
-  const newRow = headers.map((h, i) => i === 0 ? tag : (extractedLevels[h] !== undefined ? extractedLevels[h] : ""));
-  sheet.getRange(sheet.getLastRow() + 1, 1, 1, newRow.length).setValues([newRow]);
+  const newRows = allPlayerData.map(({ tag, extracted }) =>
+    headers.map((h, i) => i === 0 ? tag : (extracted[h] !== undefined ? extracted[h] : ""))
+  );
+  if (newRows.length > 0) {
+    sheet.getRange(sheet.getLastRow() + 1, 1, newRows.length, newRows[0].length).setValues(newRows);
+  }
+}
+
+function updateDataSheet(tag, extractedLevels) {
+  batchWriteToDataSheet([{ tag, extracted: extractedLevels }]);
 }
 
 function updateActivityLog(playerData, now, sheet, activityTagIndex) {
@@ -204,9 +258,8 @@ function updateActivityLog(playerData, now, sheet, activityTagIndex) {
 
 function fetchCapitalRaids(options) {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Capital_Raids");
-  const res = UrlFetchApp.fetch(`${BASE_URL}/clans/${CLAN_TAG}/capitalraidseasons`, options);
-  if (res.getResponseCode() !== 200) return;
-  const data = JSON.parse(res.getContentText()); if(!data.items || data.items.length === 0) return;
+  const data = fetchApi(`${BASE_URL}/clans/${CLAN_TAG}/capitalraidseasons`, options);
+  if (!data || !data.items || data.items.length === 0) return;
 
   sheet.clear(); sheet.appendRow(["Tag", "Name", "Attacks", "AttackLimit", "BonusAttacks", "Looted", "HISTORY_JSON"]);
   let historyData = data.items.map(season => {
@@ -220,131 +273,153 @@ function fetchCapitalRaids(options) {
 function updateCwlDatabase(options) {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("CWL_History");
   if (!sheet) return;
-  let res = UrlFetchApp.fetch(`${BASE_URL}/clans/${CLAN_TAG}/currentwar/leaguegroup`, options);
-  if (res.getResponseCode() === 200) {
-    let group = JSON.parse(res.getContentText());
-    if (group.state !== "notInWar" && group.season) {
-      let dataRange = sheet.getDataRange().getValues(); let rowIndex = -1;
-      for (let i = 0; i < dataRange.length; i++) { if (dataRange[i][0] === group.season) { rowIndex = i + 1;
-      break; } }
-      let payload = JSON.stringify({ season: group.season, state: group.state });
-      if (rowIndex === -1) { sheet.appendRow([group.season, payload]); } else { sheet.getRange(rowIndex, 2).setValue(payload); }
-    }
-  }
+  const group = fetchApi(`${BASE_URL}/clans/${CLAN_TAG}/currentwar/leaguegroup`, options);
+  if (!group || group.state === "notInWar" || !group.season) return;
+  let dataRange = sheet.getDataRange().getValues(); let rowIndex = -1;
+  for (let i = 0; i < dataRange.length; i++) { if (dataRange[i][0] === group.season) { rowIndex = i + 1; break; } }
+  let payload = JSON.stringify({ season: group.season, state: group.state });
+  if (rowIndex === -1) { sheet.appendRow([group.season, payload]); } else { sheet.getRange(rowIndex, 2).setValue(payload); }
 }
 
 // THE ESPIONAGE ENGINE: Deep CWL Analytics & Target Patterns
 function fetchWarData(options) {
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("War_Data"); sheet.clear();
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("War_Data");
+  sheet.clear();
   let currentWarInfo = { type: "NONE", data: null, cwlDetails: [], myCwlStats: {} };
-  let res = UrlFetchApp.fetch(`${BASE_URL}/clans/${CLAN_TAG}/currentwar/leaguegroup`, options);
-  if (res.getResponseCode() === 200) {
-    let group = JSON.parse(res.getContentText());
-    if (group.state !== "notInWar") {
-      currentWarInfo.type = "CWL";
-      currentWarInfo.data = { season: group.season, state: group.state };
 
-      let cwlWars = [];
-      let myClanTag = decodeURIComponent(CLAN_TAG);
-      let enemyAttackPatterns = {};
-      let myCwlStats = {};
+  const group = fetchApi(`${BASE_URL}/clans/${CLAN_TAG}/currentwar/leaguegroup`, options);
+  if (group && group.state !== "notInWar") {
+    currentWarInfo.type = "CWL";
+    currentWarInfo.data = { season: group.season, state: group.state };
+    let cwlWars = [];
+    let myClanTag = decodeURIComponent(CLAN_TAG);
+    let enemyAttackPatterns = {};
+    let myCwlStats = {};
 
-      if (group.rounds) {
-        for(let round of group.rounds) {
-          if(round.warTags[0] === "#0") continue;
-          for(let wTag of round.warTags) {
-            if(wTag === "#0") continue;
-            let wRes = UrlFetchApp.fetch(`${BASE_URL}/clanwarleagues/wars/${wTag.replace("#", "%23")}`, options);
-            if (wRes.getResponseCode() === 200) {
-              let wData = JSON.parse(wRes.getContentText());
-
-              [wData.clan, wData.opponent].forEach(clan => {
-                if (!enemyAttackPatterns[clan.tag]) {
-                  enemyAttackPatterns[clan.tag] = { mirrors: 0, dips: 0, reaches: 0, total: 0, threeStars: 0 };
-                }
-                let p = enemyAttackPatterns[clan.tag];
-                let oppClan = clan.tag === wData.clan.tag ? wData.opponent : wData.clan;
-
-                const oppMemberMap = new Map((oppClan.members || []).map(d => [d.tag, d]));
-                (clan.members || []).forEach(m => {
-                  if (m.attacks) {
-                    m.attacks.forEach(atk => {
-                      let defender = oppMemberMap.get(atk.defenderTag);
-                      if (defender) {
-                        p.total++;
-                        if (atk.stars === 3) p.threeStars++;
-
-                        if (m.mapPosition === defender.mapPosition) p.mirrors++;
-                        else if (m.mapPosition < defender.mapPosition) p.dips++;
-                        else p.reaches++;
-                      }
-                    });
-                  }
-                });
-              });
-
-              if (wData.clan.tag === myClanTag || wData.opponent.tag === myClanTag) {
-                let enemyClan = wData.clan.tag === myClanTag ? wData.opponent : wData.clan;
-                let myClan = wData.clan.tag === myClanTag ? wData.clan : wData.opponent;
-
-                (myClan.members || []).forEach(m => {
-                  if (!myCwlStats[m.tag]) myCwlStats[m.tag] = { attacks: 0, threeStars: 0, defenses: 0, defStars: 0 };
-                  if (m.attacks) {
-                    m.attacks.forEach(atk => {
-                      myCwlStats[m.tag].attacks++;
-                      if (atk.stars === 3) myCwlStats[m.tag].threeStars++;
-                    });
-                  }
-                });
-
-                (enemyClan.members || []).forEach(m => {
-                  if (m.attacks) {
-                    m.attacks.forEach(atk => {
-                      if (!myCwlStats[atk.defenderTag]) myCwlStats[atk.defenderTag] = { attacks: 0, threeStars: 0, defenses: 0, defStars: 0 };
-                      myCwlStats[atk.defenderTag].defenses++;
-                      myCwlStats[atk.defenderTag].defStars += atk.stars;
-                    });
-                  }
-                });
-
-                let enemyLineup = (enemyClan.members || []).map(m => ({
-                  name: m.name, tag: m.tag, th: m.townhallLevel, mapPosition: m.mapPosition, attacks: m.attacks ? m.attacks.length : 0
-                })).sort((a,b) => a.mapPosition - b.mapPosition);
-
-                let myLineup = (myClan.members || []).map(m => ({
-                  name: m.name, tag: m.tag, th: m.townhallLevel, mapPosition: m.mapPosition
-                })).sort((a,b) => a.mapPosition - b.mapPosition);
-
-                cwlWars.push({
-                  state: wData.state,
-                  opponent: { name: enemyClan.name, tag: enemyClan.tag },
-                  enemyLineup: enemyLineup,
-                  myLineup: myLineup
-                });
-              }
-            }
+    if (group.rounds) {
+      // Batch-fetch all CWL war data in parallel instead of sequential calls
+      const warRequests = [];
+      for (let round of group.rounds) {
+        for (let wTag of (round.warTags || [])) {
+          if (wTag !== "#0") {
+            warRequests.push({
+              url: `${BASE_URL}/clanwarleagues/wars/${wTag.replace("#", "%23")}`,
+              headers: { "Authorization": "Bearer " + API_TOKEN },
+              muteHttpExceptions: true
+            });
           }
         }
       }
 
-      cwlWars.forEach(w => {
-        w.attackPattern = enemyAttackPatterns[w.opponent.tag] || { mirrors: 0, dips: 0, reaches: 0, total: 0, threeStars: 0 };
-      });
+      const warResponses = warRequests.length > 0 ? UrlFetchApp.fetchAll(warRequests) : [];
+      warResponses.forEach(wRes => {
+        if (wRes.getResponseCode() !== 200) return;
+        let wData;
+        try { wData = JSON.parse(wRes.getContentText()); } catch(e) { return; }
 
-      currentWarInfo.cwlDetails = cwlWars;
-      currentWarInfo.myCwlStats = myCwlStats;
+        [wData.clan, wData.opponent].forEach(clan => {
+          if (!clan) return;
+          if (!enemyAttackPatterns[clan.tag]) {
+            enemyAttackPatterns[clan.tag] = { mirrors: 0, dips: 0, reaches: 0, total: 0, threeStars: 0, extremeDips: 0, extremeReaches: 0 };
+          }
+          let p = enemyAttackPatterns[clan.tag];
+          let oppClan = clan.tag === wData.clan.tag ? wData.opponent : wData.clan;
+          const oppMemberMap = new Map((oppClan.members || []).map(d => [d.tag, d]));
+
+          (clan.members || []).forEach(m => {
+            if (!m.attacks) return;
+            m.attacks.forEach(atk => {
+              let defender = oppMemberMap.get(atk.defenderTag);
+              if (!defender) return;
+              p.total++;
+              if (atk.stars === 3) p.threeStars++;
+              if (m.mapPosition === defender.mapPosition) p.mirrors++;
+              else if (m.mapPosition < defender.mapPosition) p.dips++;
+              else p.reaches++;
+              // TH mismatch detection: extreme = TH_MISMATCH_THRESHOLD+ TH level difference
+              const thDiff = (m.townhallLevel || 0) - (defender.townhallLevel || 0);
+              if (thDiff >= TH_MISMATCH_THRESHOLD) p.extremeDips++;
+              else if (thDiff <= -TH_MISMATCH_THRESHOLD) p.extremeReaches++;
+            });
+          });
+        });
+
+        if (wData.clan.tag === myClanTag || wData.opponent.tag === myClanTag) {
+          let enemyClan = wData.clan.tag === myClanTag ? wData.opponent : wData.clan;
+          let myClan = wData.clan.tag === myClanTag ? wData.clan : wData.opponent;
+
+          (myClan.members || []).forEach(m => {
+            if (!myCwlStats[m.tag]) myCwlStats[m.tag] = { attacks: 0, threeStars: 0, defenses: 0, defStars: 0 };
+            if (m.attacks) m.attacks.forEach(atk => {
+              myCwlStats[m.tag].attacks++;
+              if (atk.stars === 3) myCwlStats[m.tag].threeStars++;
+            });
+          });
+
+          (enemyClan.members || []).forEach(m => {
+            if (!m.attacks) return;
+            m.attacks.forEach(atk => {
+              if (!myCwlStats[atk.defenderTag]) myCwlStats[atk.defenderTag] = { attacks: 0, threeStars: 0, defenses: 0, defStars: 0 };
+              myCwlStats[atk.defenderTag].defenses++;
+              myCwlStats[atk.defenderTag].defStars += atk.stars;
+            });
+          });
+
+          // Build enemy lineup with per-member high-liability detection
+          const attacksReceived = {};
+          (myClan.members || []).forEach(m => {
+            if (!m.attacks) return;
+            m.attacks.forEach(atk => {
+              if (!attacksReceived[atk.defenderTag]) attacksReceived[atk.defenderTag] = { defenses: 0, defStars: 0 };
+              attacksReceived[atk.defenderTag].defenses++;
+              attacksReceived[atk.defenderTag].defStars += atk.stars;
+            });
+          });
+
+          let enemyLineup = (enemyClan.members || []).map(m => {
+            let ds = attacksReceived[m.tag] || { defenses: 0, defStars: 0 };
+            return {
+              name: m.name, tag: m.tag, th: m.townhallLevel, mapPosition: m.mapPosition,
+              attacks: m.attacks ? m.attacks.length : 0,
+              isHighLiability: isHighLiabilityDef(ds.defenses, ds.defStars)
+            };
+          }).sort((a,b) => a.mapPosition - b.mapPosition);
+
+          let myLineup = (myClan.members || []).map(m => ({
+            name: m.name, tag: m.tag, th: m.townhallLevel, mapPosition: m.mapPosition
+          })).sort((a,b) => a.mapPosition - b.mapPosition);
+
+          cwlWars.push({ state: wData.state, opponent: { name: enemyClan.name, tag: enemyClan.tag }, enemyLineup, myLineup });
+        }
+      });
     }
+
+    // Attach attack patterns and compute true hit rates
+    cwlWars.forEach(w => {
+      let pat = enemyAttackPatterns[w.opponent.tag] || { mirrors: 0, dips: 0, reaches: 0, total: 0, threeStars: 0, extremeDips: 0, extremeReaches: 0 };
+      pat.hitRate = pat.total > 0 ? Math.round((pat.threeStars / pat.total) * 100) : 0;
+      w.attackPattern = pat;
+    });
+
+    // Compute per-player CWL hit rate and liability flag
+    for (let tag in myCwlStats) {
+      let s = myCwlStats[tag];
+      s.hitRate = s.attacks > 0 ? Math.round((s.threeStars / s.attacks) * 100) : 0;
+      s.isHighLiability = isHighLiabilityDef(s.defenses, s.defStars);
+    }
+
+    currentWarInfo.cwlDetails = cwlWars;
+    currentWarInfo.myCwlStats = myCwlStats;
   }
+
   if (currentWarInfo.type === "NONE") {
-    res = UrlFetchApp.fetch(`${BASE_URL}/clans/${CLAN_TAG}/currentwar`, options);
-    if (res.getResponseCode() === 200) {
-      let war = JSON.parse(res.getContentText());
-      if (war.state !== "notInWar") {
-        currentWarInfo.type = "REGULAR";
-        currentWarInfo.data = { state: war.state, opponent: { name: war.opponent ? war.opponent.name : "Unknown" } };
-      }
+    const war = fetchApi(`${BASE_URL}/clans/${CLAN_TAG}/currentwar`, options);
+    if (war && war.state !== "notInWar") {
+      currentWarInfo.type = "REGULAR";
+      currentWarInfo.data = { state: war.state, opponent: { name: war.opponent ? war.opponent.name : "Unknown" } };
     }
   }
+
   let jsonPayload = JSON.stringify(currentWarInfo);
   if (jsonPayload.length > 49000) {
     currentWarInfo.cwlDetails = currentWarInfo.cwlDetails.slice(-3);
@@ -465,6 +540,19 @@ function getDashboardData() {
 
     heroNames.forEach(h => { playerObj.heroes[h] = getLvl(row, h); if(playerObj.heroes[h] > getLvl(prevRow, h)) playerObj.recentlyCompleted.push(`${h} to Lvl ${playerObj.heroes[h]}`); });
     petNames.forEach(pet => { playerObj.pets[pet] = getLvl(row, pet); if(playerObj.pets[pet] > getLvl(prevRow, pet)) playerObj.recentlyCompleted.push(`${pet} to Lvl ${playerObj.pets[pet]}`); });
+
+    // --- Advanced analytics flags ---
+    const rushScore = calcRushScore(playerObj.heroes, playerObj.thLevel);
+    const inactivityDays = act.lastSeenTs > 0 ? Math.floor((new Date().getTime() - act.lastSeenTs) / (1000 * 60 * 60 * 24)) : MAX_INACTIVITY_DAYS;
+    const cwlHitRate = cwlStats.attacks > 0 ? Math.round((cwlStats.threeStars / cwlStats.attacks) * 100) : null;
+    playerObj.rushScore = rushScore;
+    playerObj.isRushed = rushScore > 30;
+    playerObj.inactivityDays = inactivityDays;
+    playerObj.isInactive = inactivityDays > INACTIVITY_THRESHOLD_DAYS;
+    playerObj.isLowDonor = playerObj.thLevel >= MIN_TH_FOR_DONATION_CHECK && donations < MIN_EXPECTED_DONATIONS;
+    playerObj.hitRate = cwlHitRate;
+    playerObj.isHighLiability = cwlStats.isHighLiability || isHighLiabilityDef(cwlStats.defenses || 0, cwlStats.defStars || 0);
+
     results.push(playerObj);
   }
 
